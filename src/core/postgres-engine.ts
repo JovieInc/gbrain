@@ -151,6 +151,18 @@ export class PostgresEngine implements BrainEngine {
    */
   private checkoutGauge = new CheckoutGauge();
   /**
+   * Snapshot cache for `getConfig` (gbrain#1 perf). Off (TTL 0) unless a
+   * long-lived caller opts in via `setConfigCacheTtl` — `gbrain serve` does,
+   * because one put_page read ~28 distinct keys at a full pooler round trip
+   * each (~6.5s of a ~12s write). The config table is tiny, so a miss loads
+   * the whole table in one round trip. Local set/unset drop the snapshot;
+   * writes from OTHER processes become visible within the TTL. Shared by
+   * tx-scoped clones via the prototype chain, like checkoutGauge.
+   */
+  private configSnapshot: { values: Map<string, string>; at: number } | null = null;
+  private configSnapshotLoad: Promise<Map<string, string>> | null = null;
+  private configCacheTtlMs = 0;
+  /**
    * #1471: module-singleton OWNERSHIP token. `true` only for the engine whose
    * connect() actually created the shared db.ts `sql` singleton (returned
    * atomically by db.connect()). Borrowers — probe engines constructed while the
@@ -313,7 +325,7 @@ export class PostgresEngine implements BrainEngine {
       const timeouts = db.resolveSessionTimeouts();
       const opts: Record<string, unknown> = {
         max: size,
-        idle_timeout: 20,
+        idle_timeout: db.resolveIdleTimeoutSeconds(),
         connect_timeout: 10,
         // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
         max_lifetime: db.resolveMaxLifetimeSeconds(),
@@ -5758,7 +5770,42 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
+  /** Enable (ttlMs > 0) or disable (0) the getConfig snapshot cache. */
+  setConfigCacheTtl(ttlMs: number): void {
+    this.configCacheTtlMs = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : 0;
+    this.configSnapshot = null;
+  }
+
+  private loadConfigSnapshot(): Promise<Map<string, string>> {
+    if (this.configSnapshotLoad) return this.configSnapshotLoad;
+    const load = this.connRetry(async () => {
+      const rows = await this.sql<{ key: string; value: string }[]>`SELECT key, value FROM config`;
+      return new Map(rows.map(r => [r.key, r.value] as [string, string]));
+    }).then((values) => {
+      // A local write that landed mid-load cleared configSnapshotLoad; don't
+      // resurrect the pre-write view.
+      if (this.configSnapshotLoad === load) this.configSnapshot = { values, at: Date.now() };
+      return values;
+    }).finally(() => {
+      if (this.configSnapshotLoad === load) this.configSnapshotLoad = null;
+    });
+    this.configSnapshotLoad = load;
+    return load;
+  }
+
+  private invalidateConfigSnapshot(): void {
+    this.configSnapshot = null;
+    this.configSnapshotLoad = null;
+  }
+
   async getConfig(key: string): Promise<string | null> {
+    if (this.configCacheTtlMs > 0) {
+      const snap = this.configSnapshot;
+      const values = snap && Date.now() - snap.at < this.configCacheTtlMs
+        ? snap.values
+        : await this.loadConfigSnapshot();
+      return values.get(key) ?? null;
+    }
     // #1603: a transient pooler drop on this read used to throw / fall through
     // to defaults silently — which on remote Postgres surfaces as the wrong
     // search mode/knobs and empty-stdout queries.
@@ -5769,19 +5816,29 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async setConfig(key: string, value: string): Promise<void> {
-    return this.connRetry(async () => {
-      await this.sql`
-        INSERT INTO config (key, value) VALUES (${key}, ${value})
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-      `;
-    });
+    this.invalidateConfigSnapshot();
+    try {
+      await this.connRetry(async () => {
+        await this.sql`
+          INSERT INTO config (key, value) VALUES (${key}, ${value})
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        `;
+      });
+    } finally {
+      this.invalidateConfigSnapshot();
+    }
   }
 
   async unsetConfig(key: string): Promise<number> {
-    return this.connRetry(async () => {
-      const result = await this.sql`DELETE FROM config WHERE key = ${key}` as unknown as { count: number };
-      return result.count ?? 0;
-    });
+    this.invalidateConfigSnapshot();
+    try {
+      return await this.connRetry(async () => {
+        const result = await this.sql`DELETE FROM config WHERE key = ${key}` as unknown as { count: number };
+        return result.count ?? 0;
+      });
+    } finally {
+      this.invalidateConfigSnapshot();
+    }
   }
 
   async listConfigKeys(prefix: string): Promise<string[]> {
