@@ -777,8 +777,27 @@ export async function embeddingWidthStartupWarning(engine: BrainEngine): Promise
   }
 }
 
+/**
+ * gbrain#1: TTL for the serve process's getConfig read-through cache.
+ * Default 30s; `GBRAIN_CONFIG_CACHE_TTL_MS=0` disables. Serve-only — workers
+ * keep uncached reads because some config keys double as coordination state.
+ */
+export const DEFAULT_SERVE_CONFIG_CACHE_TTL_MS = 30_000;
+export function resolveServeConfigCacheTtlMs(env: string | undefined = process.env.GBRAIN_CONFIG_CACHE_TTL_MS): number {
+  if (env === undefined || env.trim() === '') return DEFAULT_SERVE_CONFIG_CACHE_TTL_MS;
+  const n = Number(env);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SERVE_CONFIG_CACHE_TTL_MS;
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
+  (engine as { setConfigCacheTtl?: (ms: number) => void }).setConfigCacheTtl?.(resolveServeConfigCacheTtlMs());
+  // gbrain#1: remote put_page returns after persisting; embedding runs here.
+  // GBRAIN_SERVE_BACKGROUND_EMBED=0 restores inline embedding.
+  if (process.env.GBRAIN_SERVE_BACKGROUND_EMBED !== '0') {
+    const { startBackgroundEmbedder } = await import('../core/background-embed.ts');
+    startBackgroundEmbedder(engine);
+  }
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
   // gbrain's primary use case is a personal-knowledge brain on a laptop;
   // the pre-v0.34 default exposed brains on every interface. Server

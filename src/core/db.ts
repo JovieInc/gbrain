@@ -165,6 +165,24 @@ export function resolveMaxLifetimeSeconds(
 }
 
 /**
+ * gbrain#1: seconds an idle pooled connection lives before postgres.js closes
+ * it. Default 20 (postgres.js-era behavior). A long-lived server whose
+ * callers write every few minutes paid a fresh TLS + pooler handshake
+ * (~1-2s over a remote pooler) on most requests at 20s; `gbrain serve`
+ * deployments set `GBRAIN_PG_IDLE_TIMEOUT=300`. `0` keeps idle connections
+ * open indefinitely (postgres.js semantics). Invalid values use the default.
+ */
+export const DEFAULT_PG_IDLE_TIMEOUT_S = 20;
+export function resolveIdleTimeoutSeconds(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.GBRAIN_PG_IDLE_TIMEOUT;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_PG_IDLE_TIMEOUT_S;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_PG_IDLE_TIMEOUT_S;
+}
+
+/**
  * Session-level GUCs applied to every new backend connection. Prevents
  * orphan pgbouncer sessions from holding locks or running queries
  * indefinitely when the postgres.js client disconnects mid-transaction
@@ -287,7 +305,7 @@ export async function connect(config: EngineConfig): Promise<boolean> {
     const timeouts = resolveSessionTimeouts();
     const opts: Record<string, unknown> = {
       max: resolvePoolSize(),
-      idle_timeout: 20,
+      idle_timeout: resolveIdleTimeoutSeconds(),
       connect_timeout: 10,
       // Explicit (matches the postgres.js implicit default; GBRAIN_POOL_MAX_LIFETIME_S overrides).
       max_lifetime: resolveMaxLifetimeSeconds(),

@@ -414,7 +414,11 @@ const put_page: Operation = {
     // oneshot runner) also defers — chunks land `embedding IS NULL` and the
     // standing embed machinery backfills them outside the model loop.
     const { isAvailable } = await import('../ai/gateway.ts');
-    const noEmbed = ctx.deferEmbeds === true || !isAvailable('embedding');
+    // gbrain#1: on a long-lived server with the background embedder running,
+    // remote writes persist + return and embed off the request path.
+    const { getBackgroundEmbedder } = await import('../background-embed.ts');
+    const backgroundEmbedder = ctx.remote !== false && isAvailable('embedding') ? getBackgroundEmbedder() : null;
+    const noEmbed = ctx.deferEmbeds === true || backgroundEmbedder !== null || !isAvailable('embedding');
     // v0.31.8 (D7 / codex OV-1): thread ctx.sourceId so put_page on a
     // multi-source brain lands in the intended source instead of the
     // default-source clobber path. importFromContent already accepts
@@ -747,6 +751,11 @@ const put_page: Operation = {
       writerLint = { status: 'lint_error' };
     }
 
+    let embedDeferred = false;
+    if (backgroundEmbedder && result.status === 'imported' && result.chunks > 0) {
+      embedDeferred = backgroundEmbedder.enqueue(result.slug, ctx.sourceId ?? 'default');
+    }
+
     // #2822: a 0-chunk put looks like success but the page is unsearchable —
     // say WHY instead of leaving the caller to discover it at query time.
     let chunkSkipReason: string | undefined;
@@ -782,6 +791,7 @@ const put_page: Operation = {
       ...(factsQueued ? { facts_backstop: factsQueued } : {}),
       ...(chronicleQueued ? { chronicle_backstop: chronicleQueued } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
+      ...(embedDeferred ? { embedding: 'queued' } : {}),
     };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
