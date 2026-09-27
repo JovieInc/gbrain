@@ -1351,6 +1351,29 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(result.status).json(result.body);
   });
 
+  // gbrain#1: latency SLO status (aggregates only) for operator agents.
+  // Always 200 when computed — `status` carries ok/breach — and 503 only
+  // when the brain can't be queried. Cached 60s so pollers cost ~nothing.
+  let perfCache: { at: number; body: unknown } | null = null;
+  let perfInflight: Promise<unknown> | null = null;
+  app.get('/health/perf', async (_req, res) => {
+    try {
+      if (!perfCache || Date.now() - perfCache.at > 60_000) {
+        perfInflight ??= (async () => {
+          const { collectPerfStatus } = await import('../core/perf-slo.ts');
+          const { getBackgroundEmbedder } = await import('../core/background-embed.ts');
+          const body = { version: VERSION, ...(await collectPerfStatus(engine, { embedder: getBackgroundEmbedder()?.stats() ?? null })) };
+          perfCache = { at: Date.now(), body };
+          return body;
+        })().finally(() => { perfInflight = null; });
+        await perfInflight;
+      }
+      res.status(200).json(perfCache!.body);
+    } catch (e) {
+      res.status(503).json({ error: 'service_unavailable', error_description: e instanceof Error ? e.message : 'perf status failed' });
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // Admin authentication (cookie-based)
   // ---------------------------------------------------------------------------
